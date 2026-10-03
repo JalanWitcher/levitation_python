@@ -2,7 +2,6 @@ import numpy as np
 import ode_cpp
 
 from typing import Tuple, Union, Optional, Sequence, List
-# from ...odeSolvers import generalAux
 from levitation_python import generalAux
 from scipy.interpolate import CubicSpline, CubicHermiteSpline
 
@@ -13,7 +12,7 @@ def integraCPP(tAux: Union[Sequence[float], np.ndarray],
                Phi: Union[float, Sequence[float]] = 0., 
                dA: float = 0., omega: float = 0.,
                maxPeaks: int = 100, peaksTimeStart: float = 0., 
-               rtol: float = 1e-7, atol: float = 1e-10, 
+               rtol: float = 1e-7, atol: float = 1e-10, initialStep: float = 1e-4,
                oldSol: Optional[generalAux.DotDict] = None) -> generalAux.DotDict:
     """
     Executes the C++ DOP853 integrator to solve the Acoustic Levitation ODE.
@@ -36,12 +35,14 @@ def integraCPP(tAux: Union[Sequence[float], np.ndarray],
     * `maxPeaks` (int): Maximum number of minima/maxima to track. Tracks all if <= 0.
     * `peaksTimeStart` (float): Global time at which peak tracking begins.
     * `rtol`, `atol` (float): Relative and absolute tolerances for the DOP853 solver.
+    * `initialStep` (float): Initial step size for the integrator.
     * `oldSol` (Optional[DotDict]): Previous solution to concatenate with the new integration.
 
     **Returns:**
     * `generalAux.DotDict`: Attribute callable Dictionary containing the time arrays, state arrays, tracked peaks, and continuous spline interpolators.
     """
-    
+
+    # Define the simulation mode based on the provided parameters
     if isinstance(Amp, (list, tuple)):
         mode = 0
         val0, val1 = Amp[0], Amp[-1]
@@ -62,11 +63,15 @@ def integraCPP(tAux: Union[Sequence[float], np.ndarray],
         val0 = val1 = Amp
         baseA = Amp
         basePhi = Phi
-    t, z, v, tMax, zMax, tMin, zMin = ode_cpp.run_simulation(z0=Y0[0], v0=Y0[1], breakpoints=tAux,
+
+    # Run the C++ DOP853 integrator to simulate the system dynamics
+    t, z, v, tMax, zMax, tMin, zMin, captured = ode_cpp.run_simulation(z0=Y0[0], v0=Y0[1], breakpoints=tAux,
                                                               k=k, gEf=gEf, B=B, zEq=zEq,Lambda=Lambda,
                                                               val0=val0, val1=val1, base_A=baseA, base_phi=basePhi, dA=dA, omega=omega,
-                                                              max_peaks=maxPeaks, trackerStartTime=peaksTimeStart, simMode=mode, rtol=rtol, atol=atol)
+                                                              max_peaks=maxPeaks, trackerStartTime=peaksTimeStart, simMode=mode, 
+                                                              rtol=rtol, atol=atol, initialStep=initialStep)
 
+    # Check if theres a previous solution to concatenate with the new integration results
     if oldSol is None:
         tEf, zEf, vEf = t, z, v
         tMaxEf, zMaxEf, tMinEf, zMinEf = tMax, zMax, tMin, zMin
@@ -79,15 +84,22 @@ def integraCPP(tAux: Union[Sequence[float], np.ndarray],
         zMaxEf = np.concatenate((oldSol.Eventos_z['eventoMax'], zMax))
         zMinEf = np.concatenate((oldSol.Eventos_z['eventoMin'], zMin))
 
+    # Prepare the state arrays for interpolation
     tUnique, indexUnique = np.unique(tEf, return_index=True)
     yUnique = np.vstack((zEf, vEf))[:, indexUnique]
+
+    # Create cubic spline interpolators for the state variables
     solCppAll = CubicSpline(tUnique, yUnique, axis=1)
+
+    # Create a cubic Hermite spline interpolator for the position variable
     solCppZ = CubicHermiteSpline(x=tUnique, y=yUnique[0], dydx=yUnique[1])
 
+    # Uses the Hermite spline for position and the cubic spline for velocity
     def solCppFull(t):
         y = solCppAll(t)
         y[0] = solCppZ(t)
         return y
+    
     solCppFull.t_min = tUnique[0]
     solCppFull.t_max = tUnique[-1]
 
@@ -95,7 +107,6 @@ def integraCPP(tAux: Union[Sequence[float], np.ndarray],
         t=tUnique, z=yUnique[0], v=yUnique[1], sol=solCppFull,
         Eventos=dict(eventoMax=tMaxEf, eventoMin=tMinEf),
         Eventos_z=dict(eventoMax=zMaxEf, eventoMin=zMinEf),
-        Integrou=bool(abs(t[-1] - tAux[-1]) < 1e-8),
-        t_min=solCppFull.t_min, t_max=solCppFull.t_max)
+        Integrou=captured, t_min=solCppFull.t_min, t_max=solCppFull.t_max)
 
     return resultado
