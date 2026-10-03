@@ -1,5 +1,5 @@
 import sys
-from setuptools import setup
+from setuptools import setup, find_packages
 from pybind11.setup_helpers import Pybind11Extension, build_ext
 
 # Automatically apply the best hardware optimizations based on the OS
@@ -15,7 +15,7 @@ ext_modules = [
 ]
 
 setup(
-    packages=["levitation_python"], # Tells pip to grab your whole Python folder
+    packages=find_packages(),
     ext_modules=ext_modules,
     cmdclass={"build_ext": build_ext},
 )
