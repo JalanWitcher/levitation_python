@@ -148,7 +148,7 @@ def integraCPP(tAux: Union[Sequence[float], np.ndarray],
     # Prepare the state arrays for interpolation
     tUnique, indexUnique = np.unique(tEf, return_index=True)
     yUnique = np.vstack((zEf, vEf))[:, indexUnique]
-    aUnique = a[indexUnique]
+    aUnique = aEf[indexUnique]
 
     # Create cubic spline interpolators for the state variables
     solCppAll = CubicSpline(tUnique, yUnique, axis=1)
@@ -166,7 +166,7 @@ def integraCPP(tAux: Union[Sequence[float], np.ndarray],
         y = np.zeros((2, len(t)))
         y[0] = solCppZ(t)
         y[1] = solCppV(t)
-        return y
+        return y if y.shape[-1] != 1 else y.flatten()
     
     solCppFull.t_min = tUnique[0]
     solCppFull.t_max = tUnique[-1]
