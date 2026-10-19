@@ -25,7 +25,8 @@ def run_simulation(
     atol: float = 1e-10,
     initialStep: float = 1e-4
 ) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64], 
-           npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64], bool]:
+           npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64],
+           Tuple[bool, int, int, int]]:
     """
     Run DOP853 ODE integration through defined sub-intervals.
     
@@ -83,6 +84,6 @@ def run_simulation(
     Returns:
     --------
     Tuple[List[float], List[float], List[float], List[float], List[float], List[float], List[float], bool]
-        A tuple containing seven arrays and a boolean flag: (time_history, z_history, v_history, t_max, z_max, t_min, z_min, captured).
+        A tuple containing seven arrays and a boolean flag: (time_history, z_history, v_history, t_max, z_max, t_min, z_min, (captured, simMode, nAccepted, nRejected) ).
     """
     ...

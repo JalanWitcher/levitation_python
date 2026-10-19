@@ -1,6 +1,6 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h> // Automatically converts std::vector to Python lists
-#include <pybind11/numpy.h> // Add this
+#include <pybind11/numpy.h>
 #include <vector>
 #include <cmath>
 #include <tuple>
@@ -32,6 +32,9 @@ struct SystemParams {
     double omega; // Angular Frequency of Modulation
     double zEq; // Equilibrium position
     double Lambda; // Wavelength
+    double factor_Re;
+    double factor_Cd;
+    double factor_fAr;
 };
 
 // Keeps track of all validated steps of the integration 
@@ -39,7 +42,16 @@ struct TrajectoryTracker {
     std::vector<double> t;
     std::vector<double> z;
     std::vector<double> v;
+    std::vector<double> a;
     bool captured = true;
+};
+
+// Keeps informations about the integration process
+struct Status {
+    int nAccepted = 0;
+    int nRejected = 0;
+    int MODE;
+    int FAR;
 };
 
 // Fixed Butcher Tableau Constants for DOP853
@@ -103,8 +115,9 @@ namespace DOP853Const {
     };
 }
 
+
 // Movement equation of Forced Oscillations in the Acoustic Levitator
-template <int MODE>
+template <int MODE, int FAR>
 inline void levitatorODE(
     double t, 
     const State2D& y, // State y(t)
@@ -112,6 +125,7 @@ inline void levitatorODE(
     const SystemParams& params){
         dydt.z = y.v;
         double AmpEf; // Effective Amplitude
+        double fAr; // Drag Force
 
         if constexpr (MODE == 0 || MODE == 1) {
             // On-Off Intervals (Alternating Amplitude) || Phase Jumps (Alternating Phase)
@@ -122,13 +136,28 @@ inline void levitatorODE(
             double f_t = 1.0 + params.dA * sin(params.omega * t);
             AmpEf = f_t * params.A * params.gEf;
         }
-        
-        // z'' = A_Ef * cos(2*k*z - phi) - gEf - b * v
-        dydt.v = AmpEf * cos(params.two_k * y.z - params.phi) - params.gEf - params.B * y.v;
+
+        if constexpr (FAR == 0) fAr = params.B * y.v; // Linear Drag
+        else if constexpr (FAR == 1) {
+            // Flemmer Drag
+            double Re = params.factor_Re * fabs(y.v); // Reynolds number
+            if (Re < 1e-15) {
+                // Linear approximation for small v
+                fAr = 1e-3 * params.factor_fAr * y.v; // 1e-3 * m/s² -> mm/ms²
+            } else { 
+                double logRe = log10(Re);
+                double E = 0.261 * pow(Re, 0.369) - 0.105 * pow(Re, 0.431) - 0.124 / (1 + logRe*logRe);
+                double Cd = (24.0 / Re) * (pow(10.0, E));
+                fAr = 1e-3 * params.factor_Cd * Cd * y.v * fabs(y.v); // 1e-3 * m/s² -> mm/ms²
+            }
+        }
+
+        // z'' = A_Ef * cos(2*k*z - phi) - gEf - fAr
+        dydt.v = AmpEf * cos(params.two_k * y.z - params.phi) - params.gEf - fAr;
     }
 
 // Core Step Function
-template <int MODE>
+template <int MODE, int FAR>
 bool dop853_step(
     double& t, State2D& y, 
     double& h, // Time step
@@ -138,7 +167,7 @@ bool dop853_step(
         State2D y_temp; // Auxiliar state
 
         // Stage 1
-        levitatorODE<MODE>(t, y, k[0], params);
+        levitatorODE<MODE,FAR>(t, y, k[0], params);
 
         // Stage 2 to 12
         for (int i = 1; i < DOP853Const::STAGES; ++i) {
@@ -149,7 +178,7 @@ bool dop853_step(
                 y_temp.z += h * DOP853Const::A[i][j] * k[j].z;
                 y_temp.v += h * DOP853Const::A[i][j] * k[j].v; 
             }
-            levitatorODE<MODE>(t + h * DOP853Const::C[i], y_temp, k[i], params);
+            levitatorODE<MODE,FAR>(t + h * DOP853Const::C[i], y_temp, k[i], params);
         }
 
         // Combine stages for candidate solution and error estimation
@@ -217,20 +246,21 @@ double cubicSplineDerivative(
 }
 
 // Interpolates the time and position of a peak (v = 0) between two steps
-template <int MODE>
+template <int MODE, int FAR>
 void interpolatePeak(
-    double tNew, State2D yNew, // State after the step
+    double tNew, State2D yNew, double aNew, // State after the step
     double tOld, State2D yOld,  // State before the step
     double hTaken, // Size of the step
     double timeOffSet, // Offset for the current sub-interval 
     SystemParams& params,
     PeakTracker& tracker){
         // Get accelerations at the boundaries to build the cubic spline
-        State2D dyOld, dyNew;
-        levitatorODE<MODE>(tOld, yOld, dyOld, params);
-        levitatorODE<MODE>(tNew, yNew, dyNew, params);
+        // State2D dyOld, dyNew;
+        State2D dyOld;
+        levitatorODE<MODE,FAR>(tOld, yOld, dyOld, params);
+        // levitatorODE<MODE,FAR>(tNew, yNew, dyNew, params);
         double aOld = dyOld.v;
-        double aNew = dyNew.v;
+        // double aNew = dyNew.v;
 
         // Initial guess for the root fraction 's' (Linear Interpolation)
         double s = (0.0 - yOld.v) / (yNew.v - yOld.v);
@@ -281,7 +311,7 @@ void interpolatePeak(
 }
 
 // Integration Loop
-template <int MODE>
+template <int MODE, int FAR>
 void integrate_dop853(
     State2D& y, double& t,
     const double* breakpoints, int num_breakpoints, // Sub-intervals time limits
@@ -290,11 +320,17 @@ void integrate_dop853(
     SystemParams& params, // Parameters that defines the system
     PeakTracker& trackerMax, // Tracker of the maxima
     PeakTracker& trackerMin, // Tracker of the minima
-    TrajectoryTracker& trajectory){ // Tracker of validated steps
+    TrajectoryTracker& trajectory, // Tracker of validated steps
+    Status& integrationStatus){ 
+        // Calculate initial acceleration
+        State2D dyOld;
+        levitatorODE<MODE,FAR>(t, y, dyOld, params);
+
         // Record the initial state using the GLOBAL initial time
         trajectory.t.push_back(breakpoints[0]);
         trajectory.z.push_back(y.z);
         trajectory.v.push_back(y.v);
+        trajectory.a.push_back(dyOld.v);
 
         // Perform the integration along each sub-interval
         for (int b = 1; b < num_breakpoints; ++b) {
@@ -315,25 +351,32 @@ void integrate_dop853(
                 if (t + h > target_t) h = target_t - t;
                 
                 // State before next step
-                double t_old = t;
-                State2D y_old = y;
+                double tOld = t;
+                State2D yOld = y;
+                
                 // Size of the next step
                 double h_taken = h;
     
-                bool accepted = dop853_step<MODE>(t, y, h, rtol, atol, params);
+                bool accepted = dop853_step<MODE,FAR>(t, y, h, rtol, atol, params);
                 if (accepted) {
+                    State2D dyNew;
+                    levitatorODE<MODE,FAR>(t, y, dyNew, params);
+                    double aNew = dyNew.v;
+
+                    integrationStatus.nAccepted++;
                     // Determine the offset for this specific sub-interval
                     double current_offset = breakpoints[b-1];
                     // Verify if the step crosses the startTime of the trackers
                     if (t + current_offset >= trackerMax.start_time) { 
                         // Verify if v changed sign (z crossed a peak)
-                        if (y_old.v > 0.0 && y.v <= 0) interpolatePeak<MODE>(t, y, t_old, y_old, h_taken, current_offset, params, trackerMax);
-                        else if (y_old.v < 0.0 && y.v >= 0) interpolatePeak<MODE>(t, y, t_old, y_old, h_taken, current_offset, params, trackerMin);
+                        if (yOld.v > 0.0 && y.v <= 0.0) interpolatePeak<MODE,FAR>(t, y, aNew, tOld, yOld, h_taken, current_offset, params, trackerMax);
+                        else if (yOld.v < 0.0 && y.v >= 0.0) interpolatePeak<MODE,FAR>(t, y, aNew, tOld, yOld, h_taken, current_offset, params, trackerMin);
                     }
                     // Add the accepted step to the tracker
                     trajectory.t.push_back(t + current_offset);
                     trajectory.z.push_back(y.z);
                     trajectory.v.push_back(y.v);
+                    trajectory.a.push_back(aNew);
                     
                     // Verify if the object is too distant from its equilibrium position (Levitator unable to capture it)
                     if (fabs(y.z - params.zEq) - 2 * params.Lambda > 0) {
@@ -341,6 +384,7 @@ void integrate_dop853(
                         return; // Terminate Integration
                     }
                 }
+                else integrationStatus.nRejected++;
             }
             // Reset local time to 0 for the start of the next sub-interval
             t = 0.0;
@@ -378,14 +422,14 @@ py::array_t<T> as_pyarray(std::vector<T>&& vec) {
 }
 
 // Wrapper function Python will actually call
-std::tuple<py::array_t<double>, py::array_t<double>, py::array_t<double>, py::array_t<double>, 
-           py::array_t<double>, py::array_t<double>, py::array_t<double>, bool>
+std::tuple<py::array_t<double>, py::array_t<double>, py::array_t<double>, py::array_t<double>, py::array_t<double>, 
+           py::array_t<double>, py::array_t<double>, py::array_t<double>, 
+           std::tuple<bool, int, int, int, int>>
 run_simulation(double z0, double v0, 
                std::vector<double> breakpoints,
-               double k, double gEf, double B, double zEq, double Lambda, // System params
+               py::dict sysParamsDict, // System params
                double val0, double val1,
-               double base_A, double base_phi, double dA, double omega,
-               int max_peaks, double trackerStartTime, int simMode,
+               int max_peaks, double trackerStartTime, int simMode, int farMode,
                double rtol, double atol, double initialStep)
 {
     // Setup the inital state
@@ -393,7 +437,20 @@ run_simulation(double z0, double v0,
     // Start local integration time at 0
     double t = 0.0;
     // Sets the initial system parameters
-    SystemParams params = {base_A, 2*k, gEf, B, base_phi, dA, omega, zEq, Lambda};
+    SystemParams params = {
+        sysParamsDict.contains("base_A") ? sysParamsDict["base_A"].cast<double>() : 2.5, 
+        2 * sysParamsDict["k"].cast<double>(), 
+        sysParamsDict["gEf"].cast<double>(), 
+        sysParamsDict.contains("B") ? sysParamsDict["B"].cast<double>() : 0.0, 
+        sysParamsDict.contains("base_phi") ? sysParamsDict["base_phi"].cast<double>() : 0.0, 
+        sysParamsDict.contains("dA") ? sysParamsDict["dA"].cast<double>() : 0.0, 
+        sysParamsDict.contains("omega") ? sysParamsDict["omega"].cast<double>() : 0.0, 
+        sysParamsDict["zEq"].cast<double>(), 
+        sysParamsDict["Lambda"].cast<double>(),
+        sysParamsDict.contains("fator_Re") ? sysParamsDict["fator_Re"].cast<double>() : 0.0,
+        sysParamsDict.contains("fator_Cd") ? sysParamsDict["fator_Cd"].cast<double>() : 0.0,
+        sysParamsDict.contains("fator_fAr") ? sysParamsDict["fator_fAr"].cast<double>() : 0.0
+    };
 
     double totalIntegrationTime = breakpoints.back() - breakpoints.front();
 
@@ -406,6 +463,7 @@ run_simulation(double z0, double v0,
     trajectory.t.reserve(estimatedSteps); 
     trajectory.z.reserve(estimatedSteps);
     trajectory.v.reserve(estimatedSteps);
+    trajectory.a.reserve(estimatedSteps);
 
     // Dynamically allocate memory for the number of peaks requested
     int initialSize = (max_peaks > 0) ? max_peaks : 0;
@@ -423,17 +481,25 @@ run_simulation(double z0, double v0,
     // The number of breakpoints never reach billions
     int num_bp = static_cast<int>(breakpoints.size());
 
+    Status integrationStatus = {0,0,simMode,farMode};
+
+    // Release Python GIL before starting the C++ integration Loop
+    py::gil_scoped_release release;
+
     // Perform the integration
     if (simMode == 0) {
         params.A = val0;
-        integrate_dop853<0>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory);
+        if (farMode == 0) integrate_dop853<0, 0>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory, integrationStatus);
+        else if (farMode == 1) integrate_dop853<0, 1>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory, integrationStatus);
     } else if (simMode == 1) {
         params.phi = val0;
-        integrate_dop853<1>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory);
+        if (farMode == 0) integrate_dop853<1, 0>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory, integrationStatus);
+        else if (farMode == 1) integrate_dop853<1, 1>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory, integrationStatus);
     } else if (simMode == 2) {
-        integrate_dop853<2>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory);
+        if (farMode == 0) integrate_dop853<2, 0>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory, integrationStatus);
+        else if (farMode == 1) integrate_dop853<2, 1>(y, t, bp_ptr, num_bp, val0, val1, rtol, atol, initialStep, params, trackerMax, trackerMin, trajectory, integrationStatus);
     }
-
+    
     // Re-acquire the Python GIL after performing the integration and before before using the Python C-API
     py::gil_scoped_acquire acquire;
 
@@ -452,16 +518,17 @@ run_simulation(double z0, double v0,
         readPeaksTracker(trackerMin, py_min_times, py_min_positions);
     }
 
-    // Return the trajectory and peaks as NumPy arrays
+    // Return the Trajectory and Peaks as NumPy arrays and a tuple with Status
     return std::make_tuple(
         as_pyarray(std::move(trajectory.t)),
         as_pyarray(std::move(trajectory.z)),
         as_pyarray(std::move(trajectory.v)),
+        as_pyarray(std::move(trajectory.a)),
         as_pyarray(std::move(py_max_times)),
         as_pyarray(std::move(py_max_positions)),
         as_pyarray(std::move(py_min_times)),
         as_pyarray(std::move(py_min_positions)),
-        trajectory.captured
+        std::make_tuple(trajectory.captured, integrationStatus.MODE, integrationStatus.FAR, integrationStatus.nAccepted, integrationStatus.nRejected)
     );
 }
 
@@ -469,13 +536,12 @@ run_simulation(double z0, double v0,
 PYBIND11_MODULE(ode_cpp, m) {
     m.doc() = "C++ DOP853 Integrator for Acoustic Levitator ODEs with Peak Tracking";
     m.def("run_simulation", &run_simulation, 
-          "Run the simulation of the acoustic levitator ODEs with peak tracking and return the trajectory and peaks.",
-          py::call_guard<py::gil_scoped_release>(), // Allows the module to be executed in parallel along multiple threads during the integration
+        //   "Run the simulation of the acoustic levitator ODEs with peak tracking and return the trajectory and peaks.",
+        //   py::call_guard<py::gil_scoped_release>(), // Allows the module to be executed in parallel along multiple threads during the integration
           py::arg("z0"), py::arg("v0"),
           py::arg("breakpoints"),
-          py::arg("k"), py::arg("gEf"), py::arg("B"), py::arg("zEq"), py::arg("Lambda"),
+          py::arg("sysParamsDict"),
           py::arg("val0") = 0.0, py::arg("val1") = 2.5, 
-          py::arg("base_A") = 2.5, py::arg("base_phi") = 0.0, py::arg("dA") = 0.0, py::arg("omega") = 0.0,
-          py::arg("max_peaks") = 100, py::arg("trackerStartTime") = 0.0, py::arg("simMode") = 0, 
+          py::arg("max_peaks") = 100, py::arg("trackerStartTime") = 0.0, py::arg("simMode") = 0, py::arg("farMode") = 0, 
           py::arg("rtol") = 1e-7, py::arg("atol") = 1e-10, py::arg("initialStep") = 1e-4);
 }
